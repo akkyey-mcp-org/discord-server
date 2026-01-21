@@ -46,12 +46,15 @@ class DiscordMcpServer {
     private server: Server;
     private client: Client;
     private ready: boolean = false;
+    private loggingIn: boolean = false;
+    private pendingMessages: { channel_name: string; content: string }[] = [];
+    private loginPromise: Promise<void> | null = null;
 
     constructor() {
         this.server = new Server(
             {
                 name: 'discord-server',
-                version: '1.0.0',
+                version: '1.0.1',
             },
             {
                 capabilities: {
@@ -85,19 +88,87 @@ class DiscordMcpServer {
         this.client.once('ready', () => {
             console.error(`[Discord] Logged in as ${this.client.user?.tag}`);
             this.ready = true;
+            this.loggingIn = false;
+            this.flushPendingMessages();
         });
 
         this.client.on('error', (error) => {
             console.error('[Discord Error]', error);
+            this.loggingIn = false;
+        });
+
+        this.client.on('shardDisconnect', () => {
+            console.error('[Discord] Disconnected');
+            this.ready = false;
+        });
+
+        this.client.on('shardReconnecting', () => {
+            console.error('[Discord] Reconnecting...');
         });
     }
 
-    private async getChannelByName(name: string): Promise<TextChannel> {
-        if (!this.ready) {
-            throw new McpError(ErrorCode.InternalError, 'Discord client is not ready yet.');
+    private async ensureConnected() {
+        if (this.ready) return;
+
+        if (this.loggingIn && this.loginPromise) {
+            await this.loginPromise;
+            return;
         }
 
-        // Iterate over all guilds cache
+        console.error('[Discord] Attempting to login...');
+        this.loggingIn = true;
+        this.loginPromise = (async () => {
+            try {
+                await this.client.login(TOKEN);
+                // Wait for ready event if login didn't throw
+                if (!this.ready) {
+                    await new Promise<void>((resolve, reject) => {
+                        const timeout = setTimeout(() => reject(new Error('Login timeout')), 15000);
+                        this.client.once('ready', () => {
+                            clearTimeout(timeout);
+                            resolve();
+                        });
+                        this.client.once('error', (err) => {
+                            clearTimeout(timeout);
+                            reject(err);
+                        });
+                    });
+                }
+            } catch (error) {
+                this.loggingIn = false;
+                this.loginPromise = null;
+                throw error;
+            }
+        })();
+
+        await this.loginPromise;
+    }
+
+    private async flushPendingMessages() {
+        if (this.pendingMessages.length === 0) return;
+
+        console.error(`[Discord] Flushing ${this.pendingMessages.length} pending messages...`);
+        const messages = [...this.pendingMessages];
+        this.pendingMessages = [];
+
+        for (const msg of messages) {
+            try {
+                const channel = await this.getChannelByName(msg.channel_name);
+                await channel.send(`${msg.content}\n\n*(Note: This message was delayed due to connection issues)*`);
+            } catch (error) {
+                console.error(`[Discord] Failed to send pending message: ${error}`);
+                // Put back in queue if it's a connection issue
+                this.pendingMessages.push(msg);
+            }
+        }
+    }
+
+    private async getChannelByName(name: string): Promise<TextChannel> {
+        // ensureConnected should have been called before
+        if (!this.ready) {
+            throw new McpError(ErrorCode.InternalError, 'Discord client is not ready.');
+        }
+
         for (const guild of this.client.guilds.cache.values()) {
             const channel = guild.channels.cache.find(
                 (c) => c.name === name && c.isTextBased()
@@ -106,7 +177,7 @@ class DiscordMcpServer {
                 return channel as TextChannel;
             }
         }
-        throw new McpError(ErrorCode.InvalidParams, `Channel #${name} not found in any guild.`);
+        throw new McpError(ErrorCode.InvalidParams, `Channel #${name} not found.`);
     }
 
     private setupToolHandlers() {
@@ -114,21 +185,21 @@ class DiscordMcpServer {
             tools: [
                 {
                     name: 'read_recent_messages',
-                    description: 'Read recent messages from a Discord channel. Can filter by unread status or specific reaction.',
+                    description: 'Read recent messages from a Discord channel.',
                     inputSchema: {
                         type: 'object',
                         properties: {
                             channel_name: { type: 'string' },
                             limit: { type: 'number' },
-                            unread_only: { type: 'boolean', description: "Only return messages I haven't reacted to with ✅" },
-                            reaction_filter: { type: 'string', description: "Only return messages marked with this emoji (e.g. '🔴')" }
+                            unread_only: { type: 'boolean' },
+                            reaction_filter: { type: 'string' }
                         },
                         required: ['channel_name']
                     },
                 },
                 {
                     name: 'send_message',
-                    description: 'Send a message to a Discord channel.',
+                    description: 'Send a message to a Discord channel. If offline, the message will be queued.',
                     inputSchema: {
                         type: 'object',
                         properties: {
@@ -140,38 +211,13 @@ class DiscordMcpServer {
                 },
                 {
                     name: 'add_reaction',
-                    description: 'Add a reaction (default ✅) to a message. Used to mark as read.',
+                    description: 'Add a reaction to a message.',
                     inputSchema: {
                         type: 'object',
                         properties: {
                             channel_name: { type: 'string' },
                             message_id: { type: 'string' },
-                            emoji: { type: 'string', default: '✅' }
-                        },
-                        required: ['channel_name', 'message_id']
-                    },
-                },
-                {
-                    name: 'remove_reaction',
-                    description: 'Remove a reaction (default ✅) from a message. Used to mark as unread.',
-                    inputSchema: {
-                        type: 'object',
-                        properties: {
-                            channel_name: { type: 'string' },
-                            message_id: { type: 'string' },
-                            emoji: { type: 'string', default: '✅' }
-                        },
-                        required: ['channel_name', 'message_id']
-                    },
-                },
-                {
-                    name: 'delete_message',
-                    description: 'Delete a specific message from a channel. IRREVERSIBLE. Requires "Manage Messages" permission.',
-                    inputSchema: {
-                        type: 'object',
-                        properties: {
-                            channel_name: { type: 'string' },
-                            message_id: { type: 'string' }
+                            emoji: { type: 'string' }
                         },
                         required: ['channel_name', 'message_id']
                     },
@@ -181,90 +227,60 @@ class DiscordMcpServer {
 
         this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
             try {
+                // Read operations require connection
+                if (request.params.name !== 'send_message') {
+                    await this.ensureConnected();
+                }
+
                 switch (request.params.name) {
                     case 'read_recent_messages': {
                         const { channel_name, limit, unread_only, reaction_filter } = ReadMessagesSchema.parse(request.params.arguments);
                         const channel = await this.getChannelByName(channel_name);
-
-                        // Fetch more messages if filtering
                         const fetchLimit = (unread_only || reaction_filter) ? Math.min(limit * 3, 100) : Math.min(limit, 50);
                         const messages = await channel.messages.fetch({ limit: fetchLimit });
-
                         let filtered = Array.from(messages.values());
 
                         if (reaction_filter) {
-                            filtered = filtered.filter(m => {
-                                return m.reactions.cache.some(r => r.emoji.name === reaction_filter);
-                            });
+                            filtered = filtered.filter(m => m.reactions.cache.some(r => r.emoji.name === reaction_filter));
                         }
-
                         if (unread_only) {
-                            filtered = filtered.filter(m => {
-                                const myReaction = m.reactions.cache.find(r => r.emoji.name === '✅' && r.me);
-                                return !myReaction;
-                            });
+                            filtered = filtered.filter(m => !m.reactions.cache.find(r => r.emoji.name === '✅' && r.me));
                         }
 
-                        // Trim to original limit
                         filtered = filtered.slice(0, limit);
-
                         const formatted = filtered.map(m => {
                             const time = m.createdAt.toISOString();
                             const author = m.author.username;
-                            const content = m.content;
-                            const attachments = m.attachments.map(a => a.url).join(', ');
-                            const id = m.id;
                             const isRead = m.reactions.cache.find(r => r.emoji.name === '✅' && r.me) ? '[READ]' : '[NEW]';
-                            const allReactions = m.reactions.cache.map(r => r.emoji.name).join(' ');
-
-                            return `ID:${id} ${isRead} [${time}] ${author}: ${content} ${attachments ? `(Files: ${attachments})` : ''} ${allReactions ? `(Reactions: ${allReactions})` : ''}`;
+                            return `ID:${m.id} ${isRead} [${time}] ${author}: ${m.content}`;
                         }).reverse().join('\n');
 
-                        return {
-                            content: [{ type: 'text', text: formatted || 'No messages found.' }]
-                        };
+                        return { content: [{ type: 'text', text: formatted || 'No messages found.' }] };
                     }
                     case 'send_message': {
                         const { channel_name, content } = SendMessageSchema.parse(request.params.arguments);
-                        const channel = await this.getChannelByName(channel_name);
-                        await channel.send(content);
-                        return {
-                            content: [{ type: 'text', text: `Message sent to #${channel_name}` }]
-                        };
+                        try {
+                            await this.ensureConnected();
+                            const channel = await this.getChannelByName(channel_name);
+                            await channel.send(content);
+                            return { content: [{ type: 'text', text: `✅ Message sent to #${channel_name}` }] };
+                        } catch (error) {
+                            console.error(`[Discord] Send failed, queuing message: ${error}`);
+                            this.pendingMessages.push({ channel_name, content });
+                            return {
+                                content: [{
+                                    type: 'text',
+                                    text: `⚠️ [QUEUE] ネットワークまたは接続の問題により、メッセージを「送信待ちリスト」に保存しました。接続が回復し次第、自動的に #${channel_name} へ送信されます。`
+                                }]
+                            };
+                        }
                     }
                     case 'add_reaction': {
                         const { channel_name, message_id, emoji } = ReactionSchema.parse(request.params.arguments);
                         const channel = await this.getChannelByName(channel_name);
                         const message = await channel.messages.fetch(message_id);
                         await message.react(emoji || '✅');
-                        return {
-                            content: [{ type: 'text', text: `Added ${emoji || '✅'} to message ${message_id}` }]
-                        };
-                    }
-                    case 'remove_reaction': {
-                        const { channel_name, message_id, emoji } = ReactionSchema.parse(request.params.arguments);
-                        const channel = await this.getChannelByName(channel_name);
-                        const message = await channel.messages.fetch(message_id);
-
-                        const reaction = message.reactions.cache.find(r => r.emoji.name === (emoji || '✅'));
-                        if (reaction) {
-                            await reaction.users.remove(this.client.user!.id);
-                            return {
-                                content: [{ type: 'text', text: `Removed ${emoji || '✅'} from message ${message_id}` }]
-                            };
-                        }
-                        return {
-                            content: [{ type: 'text', text: `Reaction ${emoji || '✅'} not found on message ${message_id}` }]
-                        };
-                    }
-                    case 'delete_message': {
-                        const { channel_name, message_id } = DeleteMessageSchema.parse(request.params.arguments);
-                        const channel = await this.getChannelByName(channel_name);
-                        const message = await channel.messages.fetch(message_id);
-                        await message.delete();
-                        return {
-                            content: [{ type: 'text', text: `Deleted message ${message_id}` }]
-                        };
+                        return { content: [{ type: 'text', text: `Added ${emoji || '✅'} to message ${message_id}` }] };
                     }
                     default:
                         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
@@ -279,13 +295,15 @@ class DiscordMcpServer {
     }
 
     async run() {
-        // Connect to Discord
-        await this.client.login(TOKEN);
-
-        // Connect to MCP
+        // Connect to MCP FIRST
         const transport = new StdioServerTransport();
         await this.server.connect(transport);
         console.error('Discord MCP Server running on stdio');
+
+        // Then attempt Discord login in background
+        this.ensureConnected().catch(err => {
+            console.error('[Discord] Initial background login failed (will retry on demand):', err.message);
+        });
     }
 }
 

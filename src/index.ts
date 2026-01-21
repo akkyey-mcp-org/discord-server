@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -9,10 +8,53 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { Client, GatewayIntentBits, TextChannel, Message } from 'discord.js';
 import { z } from 'zod';
+import * as fs from 'fs';
+
+// --- Debug Logging ---
+try {
+    const logPath = '/tmp/discord_mcp_debug.log';
+    const time = new Date().toISOString();
+    const envStatus = process.env.DISCORD_BOT_TOKEN ? 'Token Present' : 'Token MISSING';
+    const logMsg = `[${time}] STARTUP: env=${envStatus}, pid=${process.pid}, cwd=${process.cwd()}\n`;
+    fs.appendFileSync(logPath, logMsg);
+} catch (e) {
+    // Ignore logging errors
+}
+
+// Global Error Handlers for debugging
+process.on('uncaughtException', (err) => {
+    try {
+        fs.appendFileSync('/tmp/discord_mcp_debug.log', `[${new Date().toISOString()}] UNCAUGHT EXCEPTION: ${err.message}\n${err.stack}\n`);
+    } catch { }
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    try {
+        fs.appendFileSync('/tmp/discord_mcp_debug.log', `[${new Date().toISOString()}] UNHANDLED REJECTION: ${reason}\n`);
+    } catch { }
+});
+
+process.on('SIGTERM', () => {
+    try {
+        fs.appendFileSync('/tmp/discord_mcp_debug.log', `[${new Date().toISOString()}] Received SIGTERM - Process exiting...\n`);
+    } catch { }
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    try {
+        fs.appendFileSync('/tmp/discord_mcp_debug.log', `[${new Date().toISOString()}] Received SIGINT - Process exiting...\n`);
+    } catch { }
+    process.exit(0);
+});
 
 // --- Configuration ---
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
 if (!TOKEN) {
+    try {
+        fs.appendFileSync('/tmp/discord_mcp_debug.log', `[${new Date().toISOString()}] FATAL: Token missing, exiting.\n`);
+    } catch { }
     console.error('Error: DISCORD_BOT_TOKEN environment variable is required');
     process.exit(1);
 }
@@ -267,14 +309,28 @@ class DiscordMcpServer {
     }
 
     async run() {
-        const transport = new StdioServerTransport();
-        await this.server.connect(transport);
-        console.error('Discord MCP Server connected to stdio');
+        try {
+            fs.appendFileSync('/tmp/discord_mcp_debug.log', `[${new Date().toISOString()}] Connecting to transport...\n`);
+            const transport = new StdioServerTransport();
+            await this.server.connect(transport);
+            fs.appendFileSync('/tmp/discord_mcp_debug.log', `[${new Date().toISOString()}] MCP Connected!\n`);
+            console.error('Discord MCP Server connected to stdio');
 
-        // Initial connection attempt (background)
-        this.ensureConnected().catch(err => {
-            console.error('[Discord] Initial connection failed (will retry on demand):', err.message);
-        });
+            // DELAYED login to prevent startup timeout
+            // Wait 5 seconds before attempting to login
+            setTimeout(() => {
+                this.ensureConnected().catch(err => {
+                    const msg = `[${new Date().toISOString()}] Background login failed: ${err.message}\n`;
+                    fs.appendFileSync('/tmp/discord_mcp_debug.log', msg);
+                    console.error('[Discord] Initial connection failed (will retry on demand):', err.message);
+                });
+            }, 5000);
+
+        } catch (error) {
+            const msg = `[${new Date().toISOString()}] FATAL CRASH in run(): ${error}\n`;
+            fs.appendFileSync('/tmp/discord_mcp_debug.log', msg);
+            throw error;
+        }
     }
 
     private async ensureConnected() {

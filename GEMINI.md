@@ -1,0 +1,1 @@
+../.config/google-antigravity/GEMINI.md

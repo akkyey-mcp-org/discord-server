@@ -107,42 +107,7 @@ class DiscordMcpServer {
         });
     }
 
-    private async ensureConnected() {
-        if (this.ready) return;
 
-        if (this.loggingIn && this.loginPromise) {
-            await this.loginPromise;
-            return;
-        }
-
-        console.error('[Discord] Attempting to login...');
-        this.loggingIn = true;
-        this.loginPromise = (async () => {
-            try {
-                await this.client.login(TOKEN);
-                // Wait for ready event if login didn't throw
-                if (!this.ready) {
-                    await new Promise<void>((resolve, reject) => {
-                        const timeout = setTimeout(() => reject(new Error('Login timeout')), 15000);
-                        this.client.once('ready', () => {
-                            clearTimeout(timeout);
-                            resolve();
-                        });
-                        this.client.once('error', (err) => {
-                            clearTimeout(timeout);
-                            reject(err);
-                        });
-                    });
-                }
-            } catch (error) {
-                this.loggingIn = false;
-                this.loginPromise = null;
-                throw error;
-            }
-        })();
-
-        await this.loginPromise;
-    }
 
     private async flushPendingMessages() {
         if (this.pendingMessages.length === 0) return;
@@ -267,10 +232,17 @@ class DiscordMcpServer {
                         } catch (error) {
                             console.error(`[Discord] Send failed, queuing message: ${error}`);
                             this.pendingMessages.push({ channel_name, content });
+
+                            // Check if it's a persistent connection issue
+                            const isAuthError = error instanceof Error && (error.message.includes('Token') || error.message.includes('Auth'));
+                            const suggestion = isAuthError
+                                ? "設定をご確認ください。"
+                                : "接続が不安定なようです。VSCodeウィンドウをリロード(Ctrl+R)すると改善する場合があります。";
+
                             return {
                                 content: [{
                                     type: 'text',
-                                    text: `⚠️ [QUEUE] ネットワークまたは接続の問題により、メッセージを「送信待ちリスト」に保存しました。接続が回復し次第、自動的に #${channel_name} へ送信されます。`
+                                    text: `⚠️ [QUEUE] メッセージを送信待ちリストに保存しました。\n${suggestion}\n(現在、再接続を試みています...)`
                                 }]
                             };
                         }
@@ -295,15 +267,65 @@ class DiscordMcpServer {
     }
 
     async run() {
-        // Connect to MCP FIRST
         const transport = new StdioServerTransport();
         await this.server.connect(transport);
-        console.error('Discord MCP Server running on stdio');
+        console.error('Discord MCP Server connected to stdio');
 
-        // Then attempt Discord login in background
+        // Initial connection attempt (background)
         this.ensureConnected().catch(err => {
-            console.error('[Discord] Initial background login failed (will retry on demand):', err.message);
+            console.error('[Discord] Initial connection failed (will retry on demand):', err.message);
         });
+    }
+
+    private async ensureConnected() {
+        if (this.ready) return;
+
+        if (this.loggingIn) {
+            if (this.loginPromise) {
+                await this.loginPromise;
+            }
+            return;
+        }
+
+        console.error('[Discord] Attempting to login...');
+        this.loggingIn = true;
+        this.loginPromise = (async () => {
+            try {
+                await this.client.login(TOKEN);
+
+                // Wait for ready event
+                if (!this.ready) {
+                    await new Promise<void>((resolve, reject) => {
+                        const timeout = setTimeout(() => {
+                            reject(new Error('Login timeout (15s)'));
+                        }, 15000);
+
+                        const onReady = () => {
+                            clearTimeout(timeout);
+                            this.client.off('error', onError);
+                            resolve();
+                        };
+
+                        const onError = (err: any) => {
+                            clearTimeout(timeout);
+                            this.client.off('ready', onReady);
+                            reject(err);
+                        };
+
+                        this.client.once('ready', onReady);
+                        this.client.once('error', onError);
+                    });
+                }
+            } catch (error) {
+                console.error('[Discord] Login failed:', error);
+                throw error;
+            } finally {
+                this.loggingIn = false;
+                this.loginPromise = null;
+            }
+        })();
+
+        await this.loginPromise;
     }
 }
 

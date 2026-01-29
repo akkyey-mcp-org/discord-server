@@ -70,6 +70,7 @@ const ReadMessagesSchema = z.object({
 const SendMessageSchema = z.object({
     channel_name: z.string().describe("Name of the channel to send to"),
     content: z.string().describe("Message content to send"),
+    project_name: z.string().optional().describe("Project name to display in the message"),
 });
 
 const ReactionSchema = z.object({
@@ -211,7 +212,8 @@ class DiscordMcpServer {
                         type: 'object',
                         properties: {
                             channel_name: { type: 'string' },
-                            content: { type: 'string' }
+                            content: { type: 'string' },
+                            project_name: { type: 'string', description: 'Project name to display in the message' }
                         },
                         required: ['channel_name', 'content']
                     },
@@ -265,15 +267,18 @@ class DiscordMcpServer {
                         return { content: [{ type: 'text', text: formatted || 'No messages found.' }] };
                     }
                     case 'send_message': {
-                        const { channel_name, content } = SendMessageSchema.parse(request.params.arguments);
+                        const { channel_name, content, project_name } = SendMessageSchema.parse(request.params.arguments);
+                        const projectName = project_name || process.env.PROJECT_NAME || process.env.MCP_PROJECT_NAME;
+                        const messageContent = projectName ? `[${projectName}] ${content}` : content;
+
                         try {
                             await this.ensureConnected();
                             const channel = await this.getChannelByName(channel_name);
-                            await channel.send(content);
+                            await channel.send(messageContent);
                             return { content: [{ type: 'text', text: `✅ Message sent to #${channel_name}` }] };
                         } catch (error) {
                             console.error(`[Discord] Send failed, queuing message: ${error}`);
-                            this.pendingMessages.push({ channel_name, content });
+                            this.pendingMessages.push({ channel_name, content: messageContent });
 
                             // Check if it's a persistent connection issue
                             const isAuthError = error instanceof Error && (error.message.includes('Token') || error.message.includes('Auth'));

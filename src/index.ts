@@ -10,51 +10,89 @@ import { Client, GatewayIntentBits, TextChannel, Message } from 'discord.js';
 import { z } from 'zod';
 import * as fs from 'fs';
 
-// --- Debug Logging ---
-try {
-    const logPath = '/tmp/discord_mcp_debug.log';
-    const time = new Date().toISOString();
-    const envStatus = process.env.DISCORD_BOT_TOKEN ? 'Token Present' : 'Token MISSING';
-    const logMsg = `[${time}] STARTUP: env=${envStatus}, pid=${process.pid}, cwd=${process.cwd()}\n`;
-    fs.appendFileSync(logPath, logMsg);
-} catch (e) {
-    // Ignore logging errors
+// =============================================================================
+// 設定管理 (Single Source of Truth)
+// =============================================================================
+
+/**
+ * CLI引数からキーを解析する
+ * @example parseCliArg('--project-name') => 'mcp-servers'
+ */
+function parseCliArg(prefix: string): string | undefined {
+    const arg = process.argv.find(a => a.startsWith(`${prefix}=`));
+    return arg ? arg.split('=')[1] : undefined;
 }
 
-// Global Error Handlers for debugging
-process.on('uncaughtException', (err) => {
+/**
+ * デバッグログを書き込む
+ */
+function debugLog(message: string): void {
     try {
-        fs.appendFileSync('/tmp/discord_mcp_debug.log', `[${new Date().toISOString()}] UNCAUGHT EXCEPTION: ${err.message}\n${err.stack}\n`);
-    } catch { }
+        const time = new Date().toISOString();
+        fs.appendFileSync(CONFIG.debugLogPath, `[${time}] ${message}\n`);
+    } catch {
+        // ログエラーは無視
+    }
+}
+
+/**
+ * 一元管理された設定オブジェクト
+ * 全ての設定値はここから参照すること
+ */
+const CONFIG = {
+    // プロジェクト名 (優先順位: CLI引数 > 環境変数 > デフォルト)
+    projectName: parseCliArg('--project-name')
+        || process.env.PROJECT_NAME
+        || process.env.MCP_PROJECT_NAME
+        || 'mcp-servers',
+    // Discord Bot トークン
+    token: process.env.DISCORD_BOT_TOKEN,
+    // デバッグログのパス
+    debugLogPath: '/tmp/discord_mcp_debug.log',
+} as const;
+
+// =============================================================================
+// プロセスライフサイクル管理
+// =============================================================================
+
+// stdin が閉じられたら自動終了（MCP 規約準拠 - デーモン残留防止）
+process.stdin.on('end', () => {
+    debugLog('stdin closed (end), shutting down...');
+    process.exit(0);
+});
+
+process.stdin.on('close', () => {
+    debugLog('stdin closed (close), shutting down...');
+    process.exit(0);
+});
+
+// 起動ログ
+debugLog(`STARTUP: token=${CONFIG.token ? 'Present' : 'MISSING'}, project=${CONFIG.projectName}, pid=${process.pid}`);
+debugLog(`ARGS: ${JSON.stringify(process.argv)}`);
+
+// グローバルエラーハンドラ
+process.on('uncaughtException', (err) => {
+    debugLog(`UNCAUGHT EXCEPTION: ${err.message}\n${err.stack}`);
     process.exit(1);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-    try {
-        fs.appendFileSync('/tmp/discord_mcp_debug.log', `[${new Date().toISOString()}] UNHANDLED REJECTION: ${reason}\n`);
-    } catch { }
+process.on('unhandledRejection', (reason) => {
+    debugLog(`UNHANDLED REJECTION: ${reason}`);
 });
 
 process.on('SIGTERM', () => {
-    try {
-        fs.appendFileSync('/tmp/discord_mcp_debug.log', `[${new Date().toISOString()}] Received SIGTERM - Process exiting...\n`);
-    } catch { }
+    debugLog('Received SIGTERM - Process exiting...');
     process.exit(0);
 });
 
 process.on('SIGINT', () => {
-    try {
-        fs.appendFileSync('/tmp/discord_mcp_debug.log', `[${new Date().toISOString()}] Received SIGINT - Process exiting...\n`);
-    } catch { }
+    debugLog('Received SIGINT - Process exiting...');
     process.exit(0);
 });
 
-// --- Configuration ---
-const TOKEN = process.env.DISCORD_BOT_TOKEN;
-if (!TOKEN) {
-    try {
-        fs.appendFileSync('/tmp/discord_mcp_debug.log', `[${new Date().toISOString()}] FATAL: Token missing, exiting.\n`);
-    } catch { }
+// トークン必須チェック
+if (!CONFIG.token) {
+    debugLog('FATAL: Token missing, exiting.');
     console.error('Error: DISCORD_BOT_TOKEN environment variable is required');
     process.exit(1);
 }
@@ -268,7 +306,7 @@ class DiscordMcpServer {
                     }
                     case 'send_message': {
                         const { channel_name, content, project_name } = SendMessageSchema.parse(request.params.arguments);
-                        const projectName = project_name || process.env.PROJECT_NAME || process.env.MCP_PROJECT_NAME;
+                        const projectName = project_name || CONFIG.projectName;
                         const messageContent = projectName ? `[${projectName}] ${content}` : content;
 
                         try {
@@ -352,7 +390,7 @@ class DiscordMcpServer {
         this.loggingIn = true;
         this.loginPromise = (async () => {
             try {
-                await this.client.login(TOKEN);
+                await this.client.login(CONFIG.token);
 
                 // Wait for ready event
                 if (!this.ready) {
